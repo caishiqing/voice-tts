@@ -61,6 +61,7 @@ dependencies = [
   "loguru==0.7.3",
   "uvicorn==0.38.0",
   "huggingface-hub[cli,hf_xet]==0.35.3",
+  "psycopg2-binary==2.9.9",
 
   # Use "wetext" on Windows/Mac, otherwise "WeTextProcessing" on Linux.
   "wetext>=0.0.9; sys_platform != 'linux'",

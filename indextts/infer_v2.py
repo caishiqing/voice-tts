@@ -1,44 +1,43 @@
+import torch.nn.functional as F
+import random
+from transformers import SeamlessM4TFeatureExtractor
+import safetensors
+from huggingface_hub import hf_hub_download
+from modelscope import AutoModelForCausalLM
+from transformers import AutoTokenizer
+from indextts.s2mel.modules.audio import mel_spectrogram
+from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
+from indextts.s2mel.modules.bigvgan import bigvgan
+from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
+from indextts.utils.front import TextNormalizer, TextTokenizer
+from indextts.utils.checkpoint import load_checkpoint
+from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
+from indextts.gpt.model_v2 import UnifiedVoice
+from omegaconf import OmegaConf
+import warnings
+import io
+import numpy as np
+from torch.nn.utils.rnn import pad_sequence
+import torchaudio
+import torch
+import librosa
+import time
+import re
+import json
 import os
 from subprocess import CalledProcessError
 
 os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
-import json
-import re
-import time
-import librosa
-import torch
-import torchaudio
-from torch.nn.utils.rnn import pad_sequence
 
-import warnings
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
-from omegaconf import OmegaConf
-
-from indextts.gpt.model_v2 import UnifiedVoice
-from indextts.utils.maskgct_utils import build_semantic_model, build_semantic_codec
-from indextts.utils.checkpoint import load_checkpoint
-from indextts.utils.front import TextNormalizer, TextTokenizer
-
-from indextts.s2mel.modules.commons import load_checkpoint2, MyModel
-from indextts.s2mel.modules.bigvgan import bigvgan
-from indextts.s2mel.modules.campplus.DTDNN import CAMPPlus
-from indextts.s2mel.modules.audio import mel_spectrogram
-
-from transformers import AutoTokenizer
-from modelscope import AutoModelForCausalLM
-from huggingface_hub import hf_hub_download
-import safetensors
-from transformers import SeamlessM4TFeatureExtractor
-import random
-import torch.nn.functional as F
 
 class IndexTTS2:
     def __init__(
             self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None,use_deepspeed=False
+            use_cuda_kernel=None, use_deepspeed=False
     ):
         """
         Args:
@@ -233,7 +232,7 @@ class IndexTTS2:
                 n = 0
                 for k in range(len_):
                     assert code[
-                               k] != self.stop_mel_token, f"stop_mel_token {self.stop_mel_token} should be shrinked here"
+                        k] != self.stop_mel_token, f"stop_mel_token {self.stop_mel_token} should be shrinked here"
                     if code[k] != silent_token:
                         ncode_idx.append(k)
                         n = 0
@@ -306,20 +305,120 @@ class IndexTTS2:
         if self.gr_progress is not None:
             self.gr_progress(value, desc=desc)
 
-    def _load_and_cut_audio(self,audio_path,max_audio_length_seconds,verbose=False,sr=None):
-        if not sr:
-            audio, sr = librosa.load(audio_path)
-        else:
-            audio, _ = librosa.load(audio_path,sr=sr)
-        audio = torch.tensor(audio).unsqueeze(0)
-        max_audio_samples = int(max_audio_length_seconds * sr)
+    def _load_and_cut_audio(self, audio_input, max_audio_length_seconds, verbose=False, sr=None):
+        """
+        加载和截断音频，支持多种输入类型
 
+        Args:
+            audio_input: 可以是以下任意类型：
+                - str: 文件路径
+                - bytes: 音频文件的二进制数据
+                - tuple: (audio_data, sample_rate)，其中 audio_data 可以是 numpy.ndarray 或 torch.Tensor
+                - numpy.ndarray: 音频数据（需要提供 sr 参数）
+                - torch.Tensor: 音频数据（需要提供 sr 参数）
+            max_audio_length_seconds: 最大音频长度（秒）
+            verbose: 是否输出详细信息
+            sr: 采样率（当 audio_input 不是文件路径或元组时必需）
+
+        Returns:
+            (audio_tensor, sample_rate): 音频张量和采样率
+        """
+        # 判断输入类型并加载音频
+        if isinstance(audio_input, str):
+            # 文件路径（原有逻辑）
+            if verbose:
+                print(f"Loading audio from file: {audio_input}")
+            if not sr:
+                audio, sr = librosa.load(audio_input)
+            else:
+                audio, _ = librosa.load(audio_input, sr=sr)
+            audio = torch.tensor(audio).unsqueeze(0)
+
+        elif isinstance(audio_input, bytes):
+            # 二进制音频数据（从数据库或缓存读取）
+            if verbose:
+                print(f"Loading audio from bytes ({len(audio_input)} bytes)")
+            audio_buffer = io.BytesIO(audio_input)
+            if not sr:
+                audio, sr = librosa.load(audio_buffer)
+            else:
+                audio, _ = librosa.load(audio_buffer, sr=sr)
+            audio = torch.tensor(audio).unsqueeze(0)
+
+        elif isinstance(audio_input, tuple):
+            # (audio_data, sample_rate) 元组
+            audio_data, input_sr = audio_input
+            if verbose:
+                print(f"Loading audio from tuple (sr={input_sr})")
+
+            if isinstance(audio_data, np.ndarray):
+                audio = torch.from_numpy(audio_data).float()
+            elif isinstance(audio_data, torch.Tensor):
+                audio = audio_data.float()
+            else:
+                raise TypeError(f"Unsupported audio_data type in tuple: {type(audio_data)}")
+
+            # 确保是 2D tensor [1, samples] 或 [channels, samples]
+            if audio.dim() == 1:
+                audio = audio.unsqueeze(0)
+            elif audio.dim() > 2:
+                raise ValueError(f"Audio tensor has too many dimensions: {audio.dim()}")
+
+            # 如果是多声道，取第一个声道
+            if audio.shape[0] > 1:
+                audio = audio[0:1, :]
+
+            sr = input_sr
+
+        elif isinstance(audio_input, np.ndarray):
+            # 直接传入 numpy array（需要提供 sr）
+            if sr is None:
+                raise ValueError("Sample rate (sr) must be provided when passing numpy.ndarray")
+            if verbose:
+                print(f"Loading audio from numpy array (sr={sr})")
+
+            audio = torch.from_numpy(audio_input).float()
+            if audio.dim() == 1:
+                audio = audio.unsqueeze(0)
+            elif audio.dim() > 2:
+                raise ValueError(f"Audio array has too many dimensions: {audio.dim()}")
+
+            # 如果是多声道，取第一个声道
+            if audio.shape[0] > 1:
+                audio = audio[0:1, :]
+
+        elif isinstance(audio_input, torch.Tensor):
+            # 直接传入 tensor（需要提供 sr）
+            if sr is None:
+                raise ValueError("Sample rate (sr) must be provided when passing torch.Tensor")
+            if verbose:
+                print(f"Loading audio from torch.Tensor (sr={sr})")
+
+            audio = audio_input.float()
+            if audio.dim() == 1:
+                audio = audio.unsqueeze(0)
+            elif audio.dim() > 2:
+                raise ValueError(f"Audio tensor has too many dimensions: {audio.dim()}")
+
+            # 如果是多声道，取第一个声道
+            if audio.shape[0] > 1:
+                audio = audio[0:1, :]
+
+        else:
+            raise TypeError(
+                f"Unsupported audio_input type: {type(audio_input)}. "
+                f"Expected str, bytes, tuple, numpy.ndarray, or torch.Tensor"
+            )
+
+        # 截断逻辑（原有代码）
+        max_audio_samples = int(max_audio_length_seconds * sr)
         if audio.shape[1] > max_audio_samples:
             if verbose:
                 print(f"Audio too long ({audio.shape[1]} samples), truncating to {max_audio_samples} samples")
             audio = audio[:, :max_audio_samples]
+
         return audio, sr
-    
+
     def normalize_emo_vec(self, emo_vector, apply_bias=True):
         # apply biased emotion factors for better user experience,
         # by de-emphasizing emotions that can cause strange results
@@ -363,10 +462,10 @@ class IndexTTS2:
                 return None
 
     def infer_generator(self, spk_audio_prompt, text, output_path,
-              emo_audio_prompt=None, emo_alpha=1.0,
-              emo_vector=None,
-              use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
-              verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, **generation_kwargs):
+                        emo_audio_prompt=None, emo_alpha=1.0,
+                        emo_vector=None,
+                        use_emo_text=False, emo_text=None, use_random=False, interval_silence=200,
+                        verbose=False, max_text_tokens_per_segment=120, stream_return=False, quick_streaming_tokens=0, **generation_kwargs):
         print(">> starting inference...")
         self._set_gr_progress(0, "starting inference...")
         if verbose:
@@ -415,7 +514,7 @@ class IndexTTS2:
                 self.cache_s2mel_prompt = None
                 self.cache_mel = None
                 torch.cuda.empty_cache()
-            audio,sr = self._load_and_cut_audio(spk_audio_prompt,15,verbose)
+            audio, sr = self._load_and_cut_audio(spk_audio_prompt, 15, verbose)
             audio_22k = torchaudio.transforms.Resample(sr, 22050)(audio)
             audio_16k = torchaudio.transforms.Resample(sr, 16000)(audio)
 
@@ -469,7 +568,7 @@ class IndexTTS2:
             if self.cache_emo_cond is not None:
                 self.cache_emo_cond = None
                 torch.cuda.empty_cache()
-            emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt,15,verbose,sr=16000)
+            emo_audio, _ = self._load_and_cut_audio(emo_audio_prompt, 15, verbose, sr=16000)
             emo_inputs = self.extract_features(emo_audio, sampling_rate=16000, return_tensors="pt")
             emo_input_features = emo_inputs["input_features"]
             emo_attention_mask = emo_inputs["attention_mask"]
@@ -484,15 +583,15 @@ class IndexTTS2:
 
         self._set_gr_progress(0.1, "text processing...")
         text_tokens_list = self.tokenizer.tokenize(text)
-        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment, quick_streaming_tokens = quick_streaming_tokens)
+        segments = self.tokenizer.split_segments(text_tokens_list, max_text_tokens_per_segment, quick_streaming_tokens=quick_streaming_tokens)
         segments_count = len(segments)
 
         text_token_ids = self.tokenizer.convert_tokens_to_ids(text_tokens_list)
         if self.tokenizer.unk_token_id in text_token_ids:
             print(f"  >> Warning: input text contains {text_token_ids.count(self.tokenizer.unk_token_id)} unknown tokens (id={self.tokenizer.unk_token_id}):")
-            print( "     Tokens which can't be encoded: ", [t for t, id in zip(text_tokens_list, text_token_ids) if id == self.tokenizer.unk_token_id])
+            print("     Tokens which can't be encoded: ", [t for t, id in zip(text_tokens_list, text_token_ids) if id == self.tokenizer.unk_token_id])
             print(f"     Consider updating the BPE model or modifying the text to avoid unknown tokens.")
-                  
+
         if verbose:
             print("text_tokens_list:", text_tokens_list)
             print("segments count:", segments_count)
@@ -515,7 +614,7 @@ class IndexTTS2:
         s2mel_time = 0
         bigvgan_time = 0
         has_warned = False
-        silence = None # for stream_return
+        silence = None  # for stream_return
         for seg_idx, sent in enumerate(segments):
             self._set_gr_progress(0.2 + 0.7 * seg_idx / segments_count,
                                   f"speech synthesis {seg_idx + 1}/{segments_count}...")
@@ -697,6 +796,7 @@ def find_most_similar_cosine(query_vector, matrix):
     similarities = F.cosine_similarity(query_vector, matrix, dim=1)
     most_similar_index = torch.argmax(similarities)
     return most_similar_index
+
 
 class QwenEmotion:
     def __init__(self, model_dir):

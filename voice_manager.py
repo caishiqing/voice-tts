@@ -2,10 +2,9 @@
 音色管理模块
 
 提供音色信息的存储、查询、更新和删除功能
-使用SQLite作为存储后端
+支持 PostgreSQL 数据库和音频二进制数据存储
 """
 
-import sqlite3
 import os
 from pathlib import Path
 from typing import List, Optional, Dict, Any
@@ -13,6 +12,9 @@ from enum import Enum
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from loguru import logger
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from psycopg2.pool import SimpleConnectionPool
 
 
 class Gender(str, Enum):
@@ -62,14 +64,23 @@ class Role:
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'Role':
         """从字典创建实例"""
+        # 处理 datetime 对象转字符串
+        created_at = data.get('created_at')
+        if created_at and hasattr(created_at, 'isoformat'):
+            created_at = created_at.isoformat()
+
+        updated_at = data.get('updated_at')
+        if updated_at and hasattr(updated_at, 'isoformat'):
+            updated_at = updated_at.isoformat()
+
         return cls(
             voice_id=data['voice_id'],
             name=data['name'],
             gender=Gender(data['gender']),
             age=Age(data['age']),
             description=data.get('description', ''),
-            created_at=data.get('created_at'),
-            updated_at=data.get('updated_at')
+            created_at=created_at,
+            updated_at=updated_at
         )
 
 
@@ -78,7 +89,10 @@ class VoiceInfo:
     """音色信息数据类"""
     voice_id: str
     emotion: Emotion
-    audio_path: str
+    audio_data: Optional[bytes] = None
+    audio_filename: str = ""
+    file_hash: str = ""
+    sample_rate: int = 16000
     id: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
@@ -87,69 +101,109 @@ class VoiceInfo:
         """转换为字典"""
         data = asdict(self)
         data['emotion'] = self.emotion.value
+        # 不包含 audio_data（太大）
+        if 'audio_data' in data:
+            data['audio_data'] = f"<binary data: {len(self.audio_data) if self.audio_data else 0} bytes>"
         return data
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> 'VoiceInfo':
         """从字典创建实例"""
+        # 处理 datetime 对象转字符串
+        created_at = data.get('created_at')
+        if created_at and hasattr(created_at, 'isoformat'):
+            created_at = created_at.isoformat()
+
+        updated_at = data.get('updated_at')
+        if updated_at and hasattr(updated_at, 'isoformat'):
+            updated_at = updated_at.isoformat()
+
+        # 处理 audio_data（可能是 memoryview 或 bytes）
+        audio_data = data.get('audio_data')
+        if audio_data is not None and not isinstance(audio_data, bytes):
+            audio_data = bytes(audio_data)
+
         return cls(
             id=data.get('id'),
             voice_id=data['voice_id'],
             emotion=Emotion(data['emotion']),
-            audio_path=data['audio_path'],
-            created_at=data.get('created_at'),
-            updated_at=data.get('updated_at')
+            audio_data=audio_data,
+            audio_filename=data.get('audio_filename', ''),
+            file_hash=data.get('file_hash', ''),
+            sample_rate=data.get('sample_rate', 16000),
+            created_at=created_at,
+            updated_at=updated_at
         )
 
 
 class VoiceManager:
-    """音色管理器"""
+    """音色管理器（PostgreSQL 版本）"""
 
-    def __init__(self, db_dir: str = "./data/db", voices_dir: str = "./data/voices"):
+    def __init__(
+        self,
+        db_host: str = "localhost",
+        db_port: int = 5432,
+        db_name: str = "voice_tts",
+        db_user: str = "postgres",
+        db_password: str = "postgres",
+        pool_minconn: int = 1,
+        pool_maxconn: int = 10
+    ):
         """
         初始化音色管理器
 
         Args:
-            db_dir: 数据库文件目录
-            voices_dir: 音色音频文件目录
+            db_host: 数据库主机
+            db_port: 数据库端口
+            db_name: 数据库名称
+            db_user: 数据库用户
+            db_password: 数据库密码
+            pool_minconn: 连接池最小连接数
+            pool_maxconn: 连接池最大连接数
         """
-        self.db_dir = Path(db_dir)
-        self.voices_dir = Path(voices_dir)
-        self.db_path = self.db_dir / "voices.db"
-
-        # 创建必要的目录
-        self._ensure_directories()
+        # 创建连接池
+        try:
+            self.pool = SimpleConnectionPool(
+                minconn=pool_minconn,
+                maxconn=pool_maxconn,
+                host=db_host,
+                port=db_port,
+                database=db_name,
+                user=db_user,
+                password=db_password
+            )
+            logger.info(f"Connected to PostgreSQL: {db_host}:{db_port}/{db_name}")
+        except Exception as e:
+            logger.error(f"Failed to connect to PostgreSQL: {e}")
+            raise
 
         # 初始化数据库
         self._init_database()
 
-        logger.info(f"VoiceManager initialized with db_path={self.db_path}, voices_dir={self.voices_dir}")
+        logger.info(f"VoiceManager initialized with PostgreSQL")
 
-    def _ensure_directories(self):
-        """确保必要的目录存在"""
-        self.db_dir.mkdir(parents=True, exist_ok=True)
-        self.voices_dir.mkdir(parents=True, exist_ok=True)
-        logger.debug(f"Ensured directories: {self.db_dir}, {self.voices_dir}")
-
-    def _get_connection(self) -> sqlite3.Connection:
+    def _get_connection(self):
         """获取数据库连接"""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row  # 允许通过列名访问
-        return conn
+        return self.pool.getconn()
+
+    def _release_connection(self, conn):
+        """释放数据库连接"""
+        self.pool.putconn(conn)
 
     def _init_database(self):
-        """初始化数据库表"""
-        with self._get_connection() as conn:
+        """初始化数据库表（PostgreSQL）"""
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
 
             # 创建角色表
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS roles (
-                    voice_id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
+                    voice_id VARCHAR(255) PRIMARY KEY,
+                    name VARCHAR(255) NOT NULL,
                     description TEXT DEFAULT '',
-                    gender TEXT NOT NULL,
-                    age TEXT NOT NULL,
+                    gender VARCHAR(50) NOT NULL,
+                    age VARCHAR(50) NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
@@ -158,13 +212,16 @@ class VoiceManager:
             # 创建音色表
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS voices (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    voice_id TEXT NOT NULL,
-                    emotion TEXT NOT NULL,
-                    audio_path TEXT NOT NULL,
+                    id SERIAL PRIMARY KEY,
+                    voice_id VARCHAR(255) NOT NULL,
+                    emotion VARCHAR(50) NOT NULL,
+                    audio_data BYTEA NOT NULL,
+                    audio_filename VARCHAR(255) DEFAULT '',
+                    file_hash VARCHAR(64) DEFAULT '',
+                    sample_rate INTEGER DEFAULT 16000,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (voice_id) REFERENCES roles(voice_id)
+                    FOREIGN KEY (voice_id) REFERENCES roles(voice_id) ON DELETE CASCADE
                 )
             """)
 
@@ -181,9 +238,14 @@ class VoiceManager:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_role_age ON roles(age)
             """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_file_hash ON voices(file_hash)
+            """)
 
             conn.commit()
-            logger.debug("Database initialized")
+            logger.debug("PostgreSQL database initialized")
+        finally:
+            self._release_connection(conn)
 
     # ============ Role Management Methods ============
 
@@ -200,12 +262,13 @@ class VoiceManager:
         Raises:
             ValueError: 如果voice_id已存在
         """
-        with self._get_connection() as conn:
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             try:
                 cursor.execute("""
                     INSERT INTO roles (voice_id, name, description, gender, age)
-                    VALUES (?, ?, ?, ?, ?)
+                    VALUES (%s, %s, %s, %s, %s)
                 """, (
                     role.voice_id,
                     role.name,
@@ -218,9 +281,12 @@ class VoiceManager:
                 logger.info(f"Added role: voice_id={role.voice_id}, name={role.name}")
                 return True
 
-            except sqlite3.IntegrityError as e:
+            except psycopg2.IntegrityError as e:
+                conn.rollback()
                 logger.error(f"Failed to add role: voice_id {role.voice_id} already exists")
                 raise ValueError(f"Role with voice_id {role.voice_id} already exists") from e
+        finally:
+            self._release_connection(conn)
 
     def get_role(self, voice_id: str) -> Optional[Role]:
         """
@@ -232,14 +298,17 @@ class VoiceManager:
         Returns:
             角色信息对象，如果不存在则返回None
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM roles WHERE voice_id = ?", (voice_id,))
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("SELECT * FROM roles WHERE voice_id = %s", (voice_id,))
             row = cursor.fetchone()
 
             if row:
                 return Role.from_dict(dict(row))
             return None
+        finally:
+            self._release_connection(conn)
 
     def get_all_roles(self) -> List[Role]:
         """
@@ -248,12 +317,15 @@ class VoiceManager:
         Returns:
             所有角色信息列表
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
             cursor.execute("SELECT * FROM roles ORDER BY created_at DESC")
             rows = cursor.fetchall()
 
             return [Role.from_dict(dict(row)) for row in rows]
+        finally:
+            self._release_connection(conn)
 
     def search_roles(
         self,
@@ -276,15 +348,15 @@ class VoiceManager:
         params = []
 
         if gender is not None:
-            conditions.append("gender = ?")
+            conditions.append("gender = %s")
             params.append(gender.value)
 
         if age is not None:
-            conditions.append("age = ?")
+            conditions.append("age = %s")
             params.append(age.value)
 
         if name_keyword is not None:
-            conditions.append("name LIKE ?")
+            conditions.append("name LIKE %s")
             params.append(f"%{name_keyword}%")
 
         query = "SELECT * FROM roles"
@@ -292,12 +364,15 @@ class VoiceManager:
             query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY created_at DESC"
 
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
             cursor.execute(query, params)
             rows = cursor.fetchall()
 
             return [Role.from_dict(dict(row)) for row in rows]
+        finally:
+            self._release_connection(conn)
 
     def update_role(self, voice_id: str, role: Role) -> bool:
         """
@@ -310,16 +385,17 @@ class VoiceManager:
         Returns:
             是否更新成功
         """
-        with self._get_connection() as conn:
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE roles
-                SET name = ?,
-                    description = ?,
-                    gender = ?,
-                    age = ?,
+                SET name = %s,
+                    description = %s,
+                    gender = %s,
+                    age = %s,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE voice_id = ?
+                WHERE voice_id = %s
             """, (
                 role.name,
                 role.description,
@@ -336,6 +412,8 @@ class VoiceManager:
                 logger.warning(f"Failed to update role: voice_id={voice_id} not found")
 
             return success
+        finally:
+            self._release_connection(conn)
 
     def delete_role(self, voice_id: str, delete_voices: bool = False) -> bool:
         """
@@ -351,11 +429,12 @@ class VoiceManager:
         Raises:
             ValueError: 如果角色有关联的音色但delete_voices=False
         """
-        with self._get_connection() as conn:
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
 
             # 检查是否有关联的音色
-            cursor.execute("SELECT COUNT(*) FROM voices WHERE voice_id = ?", (voice_id,))
+            cursor.execute("SELECT COUNT(*) FROM voices WHERE voice_id = %s", (voice_id,))
             voice_count = cursor.fetchone()[0]
 
             if voice_count > 0 and not delete_voices:
@@ -366,13 +445,13 @@ class VoiceManager:
 
             # 如果需要删除音色
             if delete_voices and voice_count > 0:
-                cursor.execute("SELECT id FROM voices WHERE voice_id = ?", (voice_id,))
+                cursor.execute("SELECT id FROM voices WHERE voice_id = %s", (voice_id,))
                 voice_ids = [row[0] for row in cursor.fetchall()]
                 for vid in voice_ids:
-                    self.delete_voice(vid, delete_audio=True)
+                    self.delete_voice(vid, delete_audio=False)
 
             # 删除角色
-            cursor.execute("DELETE FROM roles WHERE voice_id = ?", (voice_id,))
+            cursor.execute("DELETE FROM roles WHERE voice_id = %s", (voice_id,))
             conn.commit()
             success = cursor.rowcount > 0
 
@@ -382,6 +461,8 @@ class VoiceManager:
                 logger.warning(f"Failed to delete role: voice_id={voice_id} not found")
 
             return success
+        finally:
+            self._release_connection(conn)
 
     def get_role_count(self) -> int:
         """
@@ -390,10 +471,13 @@ class VoiceManager:
         Returns:
             角色总数
         """
-        with self._get_connection() as conn:
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM roles")
             return cursor.fetchone()[0]
+        finally:
+            self._release_connection(conn)
 
     # ============ Voice Management Methods ============
 
@@ -408,53 +492,126 @@ class VoiceManager:
             新添加记录的ID
 
         Raises:
-            ValueError: 如果音频文件不存在或对应的角色不存在
+            ValueError: 如果对应的角色不存在或音频数据缺失
         """
         # 验证角色是否存在
         role = self.get_role(voice_info.voice_id)
         if role is None:
             raise ValueError(f"Role with voice_id {voice_info.voice_id} does not exist")
 
-        # 验证音频文件是否存在
-        if not os.path.exists(voice_info.audio_path):
-            raise ValueError(f"Audio file not found: {voice_info.audio_path}")
+        # 验证音频数据
+        if not voice_info.audio_data:
+            raise ValueError("audio_data is required")
 
-        with self._get_connection() as conn:
+        # 计算文件hash（如果没有提供）
+        if not voice_info.file_hash:
+            import hashlib
+            voice_info.file_hash = hashlib.sha256(voice_info.audio_data).hexdigest()
+
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute("""
-                INSERT INTO voices (voice_id, emotion, audio_path)
-                VALUES (?, ?, ?)
+                INSERT INTO voices (voice_id, emotion, audio_data, audio_filename, file_hash, sample_rate)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                RETURNING id
             """, (
                 voice_info.voice_id,
                 voice_info.emotion.value,
-                voice_info.audio_path
+                psycopg2.Binary(voice_info.audio_data),
+                voice_info.audio_filename,
+                voice_info.file_hash,
+                voice_info.sample_rate
             ))
+            voice_id = cursor.fetchone()[0]
             conn.commit()
-            voice_id = cursor.lastrowid
 
             logger.info(f"Added voice: id={voice_id}, voice_id={voice_info.voice_id}, "
-                        f"emotion={voice_info.emotion.value}")
+                        f"emotion={voice_info.emotion.value}, audio_size={len(voice_info.audio_data)} bytes")
 
             return voice_id
+        finally:
+            self._release_connection(conn)
 
-    def get_voice(self, id: int) -> Optional[VoiceInfo]:
+    def get_voice(self, id: int, include_audio_data: bool = False) -> Optional[VoiceInfo]:
         """
         根据ID获取音色信息
 
         Args:
             id: 音色记录ID
+            include_audio_data: 是否包含音频二进制数据（默认False，因为数据可能很大）
 
         Returns:
             音色信息对象，如果不存在则返回None
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM voices WHERE id = ?", (id,))
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            if include_audio_data:
+                cursor.execute("SELECT * FROM voices WHERE id = %s", (id,))
+            else:
+                cursor.execute("""
+                    SELECT id, voice_id, emotion, audio_filename, 
+                           file_hash, sample_rate, created_at, updated_at 
+                    FROM voices WHERE id = %s
+                """, (id,))
             row = cursor.fetchone()
 
             if row:
                 return VoiceInfo.from_dict(dict(row))
             return None
+        finally:
+            self._release_connection(conn)
+
+    def get_audio_data(self, id: int) -> Optional[bytes]:
+        """
+        获取指定ID的音频二进制数据
+
+        Args:
+            id: 音色记录ID
+
+        Returns:
+            音频二进制数据，如果不存在则返回None
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT audio_data FROM voices WHERE id = %s", (id,))
+            row = cursor.fetchone()
+
+            if row and row[0]:
+                return bytes(row[0])
+            return None
+        finally:
+            self._release_connection(conn)
+
+    def get_audio_data_by_voice_id(self, voice_id: str, emotion: Emotion) -> Optional[tuple]:
+        """
+        根据voice_id和情绪获取音频数据
+
+        Args:
+            voice_id: 角色ID
+            emotion: 情绪
+
+        Returns:
+            (audio_data, sample_rate) 元组，如果不存在则返回None
+        """
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT audio_data, sample_rate 
+                FROM voices 
+                WHERE voice_id = %s AND emotion = %s 
+                LIMIT 1
+            """, (voice_id, emotion.value))
+            row = cursor.fetchone()
+
+            if row and row[0]:
+                return (bytes(row[0]), row[1])
+            return None
+        finally:
+            self._release_connection(conn)
 
     def get_voices_by_voice_id(self, voice_id: str) -> List[VoiceInfo]:
         """
@@ -467,12 +624,15 @@ class VoiceManager:
         Returns:
             音色信息列表
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM voices WHERE voice_id = ?", (voice_id,))
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
+            cursor.execute("SELECT * FROM voices WHERE voice_id = %s", (voice_id,))
             rows = cursor.fetchall()
 
             return [VoiceInfo.from_dict(dict(row)) for row in rows]
+        finally:
+            self._release_connection(conn)
 
     def search_voices(
         self,
@@ -498,19 +658,19 @@ class VoiceManager:
         params = []
 
         if voice_id is not None:
-            conditions.append("v.voice_id = ?")
+            conditions.append("v.voice_id = %s")
             params.append(voice_id)
 
         if emotion is not None:
-            conditions.append("v.emotion = ?")
+            conditions.append("v.emotion = %s")
             params.append(emotion.value)
 
         if gender is not None:
-            conditions.append("r.gender = ?")
+            conditions.append("r.gender = %s")
             params.append(gender.value)
 
         if age is not None:
-            conditions.append("r.age = ?")
+            conditions.append("r.age = %s")
             params.append(age.value)
 
         query = """
@@ -521,12 +681,15 @@ class VoiceManager:
             query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY v.created_at DESC"
 
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
             cursor.execute(query, params)
             rows = cursor.fetchall()
 
             return [VoiceInfo.from_dict(dict(row)) for row in rows]
+        finally:
+            self._release_connection(conn)
 
     def get_all_voices(self) -> List[VoiceInfo]:
         """
@@ -535,12 +698,15 @@ class VoiceManager:
         Returns:
             所有音色信息列表
         """
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
+        conn = self._get_connection()
+        try:
+            cursor = conn.cursor(cursor_factory=RealDictCursor)
             cursor.execute("SELECT * FROM voices ORDER BY created_at DESC")
             rows = cursor.fetchall()
 
             return [VoiceInfo.from_dict(dict(row)) for row in rows]
+        finally:
+            self._release_connection(conn)
 
     def update_voice(self, id: int, voice_info: VoiceInfo) -> bool:
         """
@@ -554,80 +720,82 @@ class VoiceManager:
             是否更新成功
 
         Raises:
-            ValueError: 如果音频文件不存在或对应的角色不存在
+            ValueError: 如果对应的角色不存在或音频数据缺失
         """
         # 验证角色是否存在
         role = self.get_role(voice_info.voice_id)
         if role is None:
             raise ValueError(f"Role with voice_id {voice_info.voice_id} does not exist")
 
-        # 验证音频文件是否存在
-        if not os.path.exists(voice_info.audio_path):
-            raise ValueError(f"Audio file not found: {voice_info.audio_path}")
+        # 验证音频数据
+        if not voice_info.audio_data:
+            raise ValueError("audio_data is required")
 
-        with self._get_connection() as conn:
+        # 计算文件hash（如果没有提供）
+        if not voice_info.file_hash:
+            import hashlib
+            voice_info.file_hash = hashlib.sha256(voice_info.audio_data).hexdigest()
+
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE voices
-                SET voice_id = ?,
-                    emotion = ?,
-                    audio_path = ?,
+                SET voice_id = %s,
+                    emotion = %s,
+                    audio_data = %s,
+                    audio_filename = %s,
+                    file_hash = %s,
+                    sample_rate = %s,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                WHERE id = %s
             """, (
                 voice_info.voice_id,
                 voice_info.emotion.value,
-                voice_info.audio_path,
+                psycopg2.Binary(voice_info.audio_data),
+                voice_info.audio_filename,
+                voice_info.file_hash,
+                voice_info.sample_rate,
                 id
             ))
             conn.commit()
             success = cursor.rowcount > 0
 
             if success:
-                logger.info(f"Updated voice: id={id}, voice_id={voice_info.voice_id}")
+                logger.info(f"Updated voice: id={id}, voice_id={voice_info.voice_id}, audio_size={len(voice_info.audio_data)} bytes")
             else:
                 logger.warning(f"Failed to update voice: id={id} not found")
 
             return success
+        finally:
+            self._release_connection(conn)
 
     def delete_voice(self, id: int, delete_audio: bool = False) -> bool:
         """
-        删除音色信息
+        删除音色信息（音频数据随记录一起删除）
 
         Args:
             id: 要删除的音色记录ID
-            delete_audio: 是否同时删除音频文件
+            delete_audio: 保留参数用于兼容性（音频数据总是随记录删除）
 
         Returns:
             是否删除成功
         """
-        # 如果需要删除音频文件，先获取音频路径
-        audio_path = None
-        if delete_audio:
-            voice = self.get_voice(id)
-            if voice:
-                audio_path = voice.audio_path
-
-        with self._get_connection() as conn:
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM voices WHERE id = ?", (id,))
+            cursor.execute("DELETE FROM voices WHERE id = %s", (id,))
             conn.commit()
             success = cursor.rowcount > 0
 
             if success:
                 logger.info(f"Deleted voice: id={id}")
-
-                # 删除音频文件
-                if delete_audio and audio_path and os.path.exists(audio_path):
-                    try:
-                        os.remove(audio_path)
-                        logger.info(f"Deleted audio file: {audio_path}")
-                    except Exception as e:
-                        logger.error(f"Failed to delete audio file {audio_path}: {e}")
             else:
                 logger.warning(f"Failed to delete voice: id={id} not found")
 
             return success
+        finally:
+            self._release_connection(conn)
 
     def get_voice_count(self) -> int:
         """
@@ -636,10 +804,13 @@ class VoiceManager:
         Returns:
             音色总数
         """
-        with self._get_connection() as conn:
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM voices")
             return cursor.fetchone()[0]
+        finally:
+            self._release_connection(conn)
 
     def get_unique_voice_ids(self) -> List[str]:
         """
@@ -648,7 +819,10 @@ class VoiceManager:
         Returns:
             voice_id列表
         """
-        with self._get_connection() as conn:
+        conn = self._get_connection()
+        try:
             cursor = conn.cursor()
             cursor.execute("SELECT voice_id FROM roles ORDER BY voice_id")
             return [row[0] for row in cursor.fetchall()]
+        finally:
+            self._release_connection(conn)

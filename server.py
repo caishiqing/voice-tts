@@ -27,6 +27,17 @@ async def lifespan(app: FastAPI):
     global tts_model, voice_manager
     # Startup
     try:
+        # 初始化音色管理器（PostgreSQL）
+        logger.info("Initializing VoiceManager with PostgreSQL...")
+        voice_manager = VoiceManager(
+            db_host=os.getenv("DB_HOST", "localhost"),
+            db_port=int(os.getenv("DB_PORT", "5432")),
+            db_name=os.getenv("DB_NAME", "voice_tts"),
+            db_user=os.getenv("DB_USER", "postgres"),
+            db_password=os.getenv("DB_PASSWORD", "postgres")
+        )
+        logger.success("VoiceManager initialized successfully!")
+
         logger.info("Loading IndexTTS2 model...")
         tts_model = IndexTTS2(
             cfg_path="models/IndexTTS/config.yaml",
@@ -36,11 +47,6 @@ async def lifespan(app: FastAPI):
             use_deepspeed=False
         )
         logger.success("Model loaded successfully!")
-
-        # 初始化音色管理器
-        logger.info("Initializing VoiceManager...")
-        voice_manager = VoiceManager()
-        logger.success("VoiceManager initialized successfully!")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         raise e
@@ -126,7 +132,9 @@ class VoiceResponse(BaseModel):
     id: int
     voice_id: str
     emotion: str
-    audio_path: str
+    audio_filename: str = ""
+    file_hash: str = ""
+    sample_rate: int = 16000
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -441,23 +449,24 @@ async def get_role_stats():
 async def create_voice(
     voice_id: str = Form(...),
     emotion: str = Form(...),
-    audio_file: UploadFile = File(...)
+    audio_file: UploadFile = File(...),
+    sample_rate: int = Form(16000)
 ):
     """
     创建新的音色（需要角色已存在）
+    音频数据直接存储在数据库中
 
     Args:
         voice_id: 角色voice_id标识
         emotion: 情绪 (normal/happy/angry/sad/fearful/disgusted/surprised)
         audio_file: 音色音频文件
+        sample_rate: 采样率（默认16000）
 
     Returns:
         创建的音色信息
     """
     if voice_manager is None:
         raise HTTPException(status_code=503, detail="VoiceManager not initialized")
-
-    audio_path = None  # 初始化audio_path
 
     try:
         # 验证角色是否存在
@@ -474,32 +483,27 @@ async def create_voice(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=f"Invalid emotion value: {str(e)}")
 
-        # 生成唯一的文件名
-        file_extension = Path(audio_file.filename).suffix or ".wav"
-        unique_filename = f"{voice_id}_{emotion}_{uuid.uuid4().hex[:8]}{file_extension}"
-        audio_path = voice_manager.voices_dir / unique_filename
+        # 读取音频文件的二进制数据
+        audio_data = await audio_file.read()
 
-        # 保存上传的音频文件
-        with open(audio_path, "wb") as f:
-            content = await audio_file.read()
-            f.write(content)
+        logger.info(f"Received audio file: {audio_file.filename}, size={len(audio_data)} bytes")
 
-        logger.info(f"Saved audio file to: {audio_path}")
-
-        # 创建音色信息
+        # 创建音色信息（直接存储二进制数据）
         voice_info = VoiceInfo(
             voice_id=voice_id,
             emotion=emotion_enum,
-            audio_path=str(audio_path)
+            audio_data=audio_data,
+            audio_filename=audio_file.filename,
+            sample_rate=sample_rate
         )
 
-        # 添加到数据库
+        # 添加到数据库（音频数据会被存储为 BYTEA）
         new_id = voice_manager.add_voice(voice_info)
 
-        # 获取完整信息返回
-        created_voice = voice_manager.get_voice(new_id)
+        # 获取完整信息返回（不包含音频数据以节省带宽）
+        created_voice = voice_manager.get_voice(new_id, include_audio_data=False)
 
-        logger.success(f"Created voice: id={new_id}, voice_id={voice_id}, emotion={emotion}")
+        logger.success(f"Created voice in database: id={new_id}, voice_id={voice_id}, emotion={emotion}, audio_size={len(audio_data)} bytes")
 
         return VoiceResponse(**created_voice.to_dict())
 
@@ -507,12 +511,6 @@ async def create_voice(
         raise
     except Exception as e:
         logger.error(f"Failed to create voice: {str(e)}")
-        # 清理可能已保存的文件
-        try:
-            if 'audio_path' in locals() and os.path.exists(audio_path):
-                os.remove(audio_path)
-        except Exception:
-            pass
         raise HTTPException(status_code=500, detail=f"Failed to create voice: {str(e)}")
 
 
@@ -604,40 +602,45 @@ async def get_voice(voice_db_id: int):
 @app.get("/voices/{voice_db_id}/audio")
 async def get_voice_audio(voice_db_id: int):
     """
-    获取指定ID的音色音频文件
+    获取指定ID的音色音频数据
 
     Args:
         voice_db_id: 音色数据库ID
 
     Returns:
-        音频文件
+        音频二进制数据
     """
     if voice_manager is None:
         raise HTTPException(status_code=503, detail="VoiceManager not initialized")
 
     try:
-        voice = voice_manager.get_voice(voice_db_id)
+        voice = voice_manager.get_voice(voice_db_id, include_audio_data=False)
 
         if voice is None:
             raise HTTPException(status_code=404, detail=f"Voice with id {voice_db_id} not found")
 
-        audio_path = voice.audio_path
-        if not os.path.exists(audio_path):
-            raise HTTPException(status_code=404, detail=f"Audio file not found: {audio_path}")
+        # 从数据库获取音频数据
+        audio_data = voice_manager.get_audio_data(voice_db_id)
 
-        logger.info(f"Serving audio file: {audio_path}")
+        if not audio_data:
+            raise HTTPException(status_code=404, detail=f"Audio data not found for voice {voice_db_id}")
 
-        return FileResponse(
-            path=audio_path,
+        logger.info(f"Serving audio data: {voice.audio_filename}, size={len(audio_data)} bytes")
+
+        from fastapi.responses import Response
+        return Response(
+            content=audio_data,
             media_type="audio/wav",
-            filename=os.path.basename(audio_path)
+            headers={
+                "Content-Disposition": f'attachment; filename="{voice.audio_filename}"'
+            }
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get audio file: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to get audio file: {str(e)}")
+        logger.error(f"Failed to get audio data: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to get audio data: {str(e)}")
 
 
 @app.put("/voices/{voice_db_id}", response_model=VoiceResponse)
@@ -645,7 +648,8 @@ async def update_voice(
     voice_db_id: int,
     voice_id: Optional[str] = Form(None),
     emotion: Optional[str] = Form(None),
-    audio_file: Optional[UploadFile] = File(None)
+    audio_file: Optional[UploadFile] = File(None),
+    sample_rate: Optional[int] = Form(None)
 ):
     """
     更新音色信息
@@ -655,6 +659,7 @@ async def update_voice(
         voice_id: 可选，新的voice_id
         emotion: 可选，新的情绪
         audio_file: 可选，新的音频文件
+        sample_rate: 可选，新的采样率
 
     Returns:
         更新后的音色信息
@@ -663,15 +668,17 @@ async def update_voice(
         raise HTTPException(status_code=503, detail="VoiceManager not initialized")
 
     try:
-        # 获取现有音色信息
-        existing_voice = voice_manager.get_voice(voice_db_id)
+        # 获取现有音色信息（包含数据以便可能需要保留）
+        existing_voice = voice_manager.get_voice(voice_db_id, include_audio_data=True)
         if existing_voice is None:
             raise HTTPException(status_code=404, detail=f"Voice with id {voice_db_id} not found")
 
         # 准备更新的数据
         updated_voice_id = voice_id if voice_id is not None else existing_voice.voice_id
         updated_emotion = Emotion(emotion) if emotion is not None else existing_voice.emotion
-        updated_audio_path = existing_voice.audio_path
+        updated_audio_data = existing_voice.audio_data
+        updated_audio_filename = existing_voice.audio_filename
+        updated_sample_rate = sample_rate if sample_rate is not None else existing_voice.sample_rate
 
         # 如果修改了voice_id，验证新角色是否存在
         if voice_id is not None and voice_id != existing_voice.voice_id:
@@ -684,33 +691,17 @@ async def update_voice(
 
         # 如果提供了新的音频文件
         if audio_file is not None:
-            # 生成新的文件名
-            file_extension = Path(audio_file.filename).suffix or ".wav"
-            unique_filename = f"{updated_voice_id}_{updated_emotion.value}_{uuid.uuid4().hex[:8]}{file_extension}"
-            new_audio_path = voice_manager.voices_dir / unique_filename
-
-            # 保存新的音频文件
-            with open(new_audio_path, "wb") as f:
-                content = await audio_file.read()
-                f.write(content)
-
-            logger.info(f"Saved new audio file to: {new_audio_path}")
-
-            # 删除旧的音频文件
-            if os.path.exists(existing_voice.audio_path):
-                try:
-                    os.remove(existing_voice.audio_path)
-                    logger.info(f"Deleted old audio file: {existing_voice.audio_path}")
-                except Exception as e:
-                    logger.warning(f"Failed to delete old audio file: {e}")
-
-            updated_audio_path = str(new_audio_path)
+            updated_audio_data = await audio_file.read()
+            updated_audio_filename = audio_file.filename
+            logger.info(f"Updated audio data: {updated_audio_filename}, size={len(updated_audio_data)} bytes")
 
         # 创建更新的音色信息
         updated_voice_info = VoiceInfo(
             voice_id=updated_voice_id,
             emotion=updated_emotion,
-            audio_path=updated_audio_path
+            audio_data=updated_audio_data,
+            audio_filename=updated_audio_filename,
+            sample_rate=updated_sample_rate
         )
 
         # 更新数据库
@@ -720,7 +711,7 @@ async def update_voice(
             raise HTTPException(status_code=500, detail="Failed to update voice in database")
 
         # 获取更新后的信息
-        updated_voice = voice_manager.get_voice(voice_db_id)
+        updated_voice = voice_manager.get_voice(voice_db_id, include_audio_data=False)
 
         logger.success(f"Updated voice: id={voice_db_id}")
 
@@ -736,16 +727,12 @@ async def update_voice(
 
 
 @app.delete("/voices/{voice_db_id}")
-async def delete_voice(
-    voice_db_id: int,
-    delete_audio: bool = Query(False, description="是否同时删除音频文件")
-):
+async def delete_voice(voice_db_id: int):
     """
-    删除音色
+    删除音色（包括音频数据）
 
     Args:
         voice_db_id: 音色数据库ID
-        delete_audio: 是否同时删除音频文件（默认False）
 
     Returns:
         删除结果
@@ -759,18 +746,17 @@ async def delete_voice(
         if voice is None:
             raise HTTPException(status_code=404, detail=f"Voice with id {voice_db_id} not found")
 
-        # 删除音色
-        success = voice_manager.delete_voice(voice_db_id, delete_audio=delete_audio)
+        # 删除音色（音频数据会随记录一起删除）
+        success = voice_manager.delete_voice(voice_db_id, delete_audio=False)
 
         if not success:
             raise HTTPException(status_code=500, detail="Failed to delete voice")
 
-        logger.success(f"Deleted voice: id={voice_db_id}, delete_audio={delete_audio}")
+        logger.success(f"Deleted voice: id={voice_db_id}")
 
         return {
             "success": True,
-            "message": f"Voice {voice_db_id} deleted successfully",
-            "audio_deleted": delete_audio
+            "message": f"Voice {voice_db_id} deleted successfully"
         }
 
     except HTTPException:
@@ -815,63 +801,53 @@ async def text_to_speech(request: TTSRequest):
                 detail=f"Role with voice_id '{request.voice_id}' not found"
             )
 
-        # 获取该角色的normal情绪音频作为spk_audio_prompt
-        normal_voices = voice_manager.search_voices(
-            voice_id=request.voice_id,
-            emotion=Emotion.NORMAL
+        # 获取该角色的normal情绪音频数据（直接从数据库）
+        spk_audio_result = voice_manager.get_audio_data_by_voice_id(
+            request.voice_id,
+            Emotion.NORMAL
         )
 
-        if not normal_voices:
+        if not spk_audio_result:
             raise HTTPException(
                 status_code=404,
                 detail=f"No normal emotion voice found for role '{request.voice_id}'. Please add a normal voice first."
             )
 
-        spk_audio_prompt = normal_voices[0].audio_path
+        spk_audio_data, spk_sample_rate = spk_audio_result
 
-        # 获取指定情绪的音频作为emo_audio_prompt
-        emo_audio_prompt = None
+        # 获取指定情绪的音频数据（如果需要）
+        emo_audio_data = None
+        emo_sample_rate = None
         if request.emotion != Emotion.NORMAL:
-            emotion_voices = voice_manager.search_voices(
-                voice_id=request.voice_id,
-                emotion=request.emotion
+            emo_audio_result = voice_manager.get_audio_data_by_voice_id(
+                request.voice_id,
+                request.emotion
             )
 
-            if not emotion_voices:
+            if not emo_audio_result:
                 logger.warning(
                     f"No {request.emotion.value} emotion voice found for role '{request.voice_id}', "
                     f"will use normal emotion only"
                 )
             else:
-                emo_audio_prompt = emotion_voices[0].audio_path
-
-        # 检查音频文件是否存在
-        if not os.path.exists(spk_audio_prompt):
-            logger.error(f"Speaker audio file not found: {spk_audio_prompt}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Speaker audio file not found in database"
-            )
-
-        if emo_audio_prompt and not os.path.exists(emo_audio_prompt):
-            logger.warning(f"Emotion audio file not found: {emo_audio_prompt}, using normal only")
-            emo_audio_prompt = None
+                emo_audio_data, emo_sample_rate = emo_audio_result
 
         logger.info(
             f"TTS request: voice_id={request.voice_id}, emotion={request.emotion.value}, "
-            f"text='{request.text[:50]}...', spk={spk_audio_prompt}, emo={emo_audio_prompt}"
+            f"text='{request.text[:50]}...', spk_audio_size={len(spk_audio_data)} bytes, "
+            f"emo_audio_size={len(emo_audio_data) if emo_audio_data else 0} bytes"
         )
 
         # 创建临时输出文件
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
             output_path = tmp_file.name
 
-        # 执行推理
+        # 执行推理（直接传入音频二进制数据）
         result_path = tts_model.infer(
-            spk_audio_prompt=spk_audio_prompt,
+            spk_audio_prompt=spk_audio_data,  # 直接传入二进制数据
             text=request.text,
             output_path=output_path,
-            emo_audio_prompt=emo_audio_prompt,
+            emo_audio_prompt=emo_audio_data if emo_audio_data else None,  # 直接传入二进制数据
             verbose=False
         )
 
