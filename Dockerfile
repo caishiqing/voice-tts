@@ -1,13 +1,11 @@
 # ============================================
-# 单阶段构建 Dockerfile - Ubuntu 22.04
-# 仅包含后端环境
+# IndexTTS2 API Server - Official Python Image
 # ============================================
 
-FROM ubuntu:22.04
+FROM python:3.10-slim
 
 # 设置环境变量
-ENV DEBIAN_FRONTEND=noninteractive \
-    PYTHONUNBUFFERED=1 \
+ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -15,61 +13,36 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /app
 
 # ============================================
-# 安装所有系统依赖
+# 安装系统依赖
 # ============================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # 音频处理相关
+    # 音频处理
     ffmpeg \
     libsndfile1 \
-    libsndfile1-dev \
-    # Python 相关
-    software-properties-common \
-    # 编译工具
+    # 编译工具（DeepSpeed 需要）
     build-essential \
     git \
-    wget \
-    curl \
-    ca-certificates \
-    # 清理
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # ============================================
-# 安装 Python 3.11
-# ============================================
-RUN add-apt-repository -y ppa:deadsnakes/ppa \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-dev \
-    python3.11-venv \
-    python3-pip \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
-    && python3.11 -m ensurepip --upgrade \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
-
-# 升级 pip
-RUN python3.11 -m pip install --upgrade pip setuptools wheel
-
-# ============================================
-# 复制项目所有文件
+# 复制项目文件
 # ============================================
 COPY . .
 
 # ============================================
-# 安装 Python 依赖（使用 pyproject.toml）
+# 安装 Python 依赖
 # ============================================
-RUN pip install -e .
+RUN pip install --upgrade pip setuptools wheel \
+    && pip install -e .
 
 # ============================================
-# 创建数据目录
+# 创建必要目录
 # ============================================
-RUN mkdir -p data/db data/voices models/
+RUN mkdir -p models/
 
 # 暴露端口
-EXPOSE 8000
+EXPOSE 8020
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
