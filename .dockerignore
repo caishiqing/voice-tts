@@ -42,8 +42,11 @@ ENV/
 Dockerfile
 docker-compose.yaml
 .dockerignore
-*.md
 LICENSE
+
+# 文档文件（保留 README.md，排除其他）
+*.md
+!README.md
 
 # 日志文件
 *.log

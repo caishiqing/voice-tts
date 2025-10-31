@@ -2,7 +2,7 @@
 # IndexTTS2 API Server - Official Python Image
 # ============================================
 
-FROM python:3.10-slim
+FROM docker.m.daocloud.io/python:3.10-slim
 
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1 \
@@ -34,7 +34,7 @@ COPY . .
 # 安装 Python 依赖
 # ============================================
 RUN pip install --upgrade pip setuptools wheel \
-    && pip install -e .
+    && pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple/
 
 # ============================================
 # 创建必要目录
