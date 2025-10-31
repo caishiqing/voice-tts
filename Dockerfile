@@ -37,16 +37,14 @@ RUN pip install --upgrade pip setuptools wheel \
     && pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple/
 
 # ============================================
-# 创建必要目录
+# 下载模型
 # ============================================
 RUN mkdir -p models/
+ENV HF_ENDPOINT="https://hf-mirror.com"
+RUN hf download IndexTeam/IndexTTS-2 --local-dir=models/IndexTTS
 
 # 暴露端口
 EXPOSE 8020
-
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8020/')"
 
 # 默认启动命令
 CMD ["python", "server.py", "--host", "0.0.0.0", "--port", "8020"]

@@ -1,10 +1,7 @@
 # 数据目录
-checkpoints/
-data/
-models/
-
-# 前端相关（已删除）
-frontend/node_modules
+/checkpoints/
+/data/
+/models/
 
 # Git 相关
 .git
@@ -43,10 +40,6 @@ Dockerfile
 docker-compose.yaml
 .dockerignore
 LICENSE
-
-# 文档文件（保留 README.md，排除其他）
-*.md
-!README.md
 
 # 日志文件
 *.log
