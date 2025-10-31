@@ -6,7 +6,7 @@ hf download IndexTeam/IndexTTS-2 --local-dir=models/IndexTTS
 
 # 快速启动脚本：使用 docker run 运行容器
 docker run -itd --gpus all --name indextts \
--p 8000:8000 \
+-p 8020:8020 \
 -w /app \
 -v $(pwd)/data:/app/data \
 -v $(pwd)/models:/app/models \
