@@ -62,6 +62,8 @@ dependencies = [
   "uvicorn==0.38.0",
   "huggingface-hub[cli,hf_xet]==0.35.3",
   "psycopg2-binary==2.9.9",
+  "deepspeed==0.18.1",
+  "httpx==0.28.1",
 
   # Use "wetext" on Windows/Mac, otherwise "WeTextProcessing" on Linux.
   "wetext>=0.0.9; sys_platform != 'linux'",

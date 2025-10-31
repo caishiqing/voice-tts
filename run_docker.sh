@@ -14,4 +14,4 @@ docker run -itd --gpus all --name indextts \
 --network host \
 --restart unless-stopped \
 index-tts:latest \
-python server.py --host 0.0.0.0 --port 8000 --workers 1
+python server.py --host 0.0.0.0 --port 8213 --workers 1
