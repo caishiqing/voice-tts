@@ -5,7 +5,7 @@ mkdir -p models/
 hf download IndexTeam/IndexTTS-2 --local-dir=models/IndexTTS
 
 # 快速启动脚本：使用 docker run 运行容器
-docker run -itd --gpus all --name indextts \
+docker run -itd --gpus all --name voicetts \
 -p 8020:8020 \
 -w /app \
 -v $(pwd)/data:/app/data \
@@ -13,5 +13,5 @@ docker run -itd --gpus all --name indextts \
 -e TZ=Asia/Shanghai \
 --network host \
 --restart unless-stopped \
-index-tts:latest \
+voice-tts:latest \
 python server.py --host 0.0.0.0 --port 8020 --workers 1
