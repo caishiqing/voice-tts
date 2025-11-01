@@ -30,6 +30,9 @@ def check_deepspeed_availability():
     except ImportError:
         logger.warning("DeepSpeed is not installed, falling back to normal inference. Install with: pip install deepspeed")
         return False
+    except Exception as e:
+        logger.warning(f"DeepSpeed is not available due to: {e}. Falling back to normal inference.")
+        return False
 
 
 USE_DEEPSPEED = check_deepspeed_availability()
