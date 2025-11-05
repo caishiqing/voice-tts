@@ -36,20 +36,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# ============================================
+RUN pip install --upgrade pip setuptools wheel -i https://pypi.tuna.tsinghua.edu.cn/simple/
+
 # 复制项目文件
-# ============================================
 COPY . .
 
-# ============================================
 # 安装 Python 依赖
-# ============================================
-RUN pip install --upgrade pip setuptools wheel \
-    && pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple/
+RUN pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple/
 
-# ============================================
 # 下载模型
-# ============================================
 RUN mkdir -p models/
 ENV HF_ENDPOINT="https://hf-mirror.com"
 RUN hf download IndexTeam/IndexTTS-2 --local-dir=models/IndexTTS

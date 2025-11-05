@@ -7,5 +7,5 @@ docker run -itd --gpus '"device=7"' --name voicetts \
 -e TZ=Asia/Shanghai \
 --network host \
 --restart unless-stopped \
-voice-tts:latest \
-python server.py --host 0.0.0.0 --port 8020 --workers 3
+voicetts:latest \
+python server.py --host 0.0.0.0 --port 8020 --workers 2
