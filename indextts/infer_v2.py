@@ -27,8 +27,6 @@ import json
 import os
 from subprocess import CalledProcessError
 
-os.environ['HF_HUB_CACHE'] = './checkpoints/hf_cache'
-
 
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -36,8 +34,13 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 class IndexTTS2:
     def __init__(
-            self, cfg_path="checkpoints/config.yaml", model_dir="checkpoints", use_fp16=False, device=None,
-            use_cuda_kernel=None, use_deepspeed=False
+            self, 
+            cfg_path="models/IndexTTS/config.yaml", 
+            model_dir="models/IndexTTS", 
+            use_fp16=False, 
+            device=None,
+            use_cuda_kernel=None, 
+            use_deepspeed=False
     ):
         """
         Args:

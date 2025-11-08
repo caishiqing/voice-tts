@@ -64,6 +64,7 @@ dependencies = [
   "psycopg2-binary==2.9.9",
   "deepspeed==0.18.1",
   "httpx==0.28.1",
+  "gunicorn==23.0.0",
 
   # Use "wetext" on Windows/Mac, otherwise "WeTextProcessing" on Linux.
   "wetext>=0.0.9; sys_platform != 'linux'",

@@ -7,38 +7,17 @@ from loguru import logger
 import uvicorn
 import os
 import tempfile
-import torch
-import httpx
+import requests
 import wave
 import re
 from enum import Enum
 
-from indextts.infer_v2 import IndexTTS2
+# 延迟导入 torch 和模型相关的模块，避免在主进程中初始化 CUDA 上下文
+# torch 和 IndexTTS2 将在子进程的 lifespan 中导入
 
-
-# 自动检测 DeepSpeed 和 CUDA 是否可用
-def check_deepspeed_availability():
-    """检测 DeepSpeed 是否安装并且 CUDA 是否可用"""
-    if not torch.cuda.is_available():
-        logger.info("CUDA is not available, DeepSpeed will be disabled")
-        return False
-
-    try:
-        import deepspeed
-        logger.success(f"DeepSpeed is available (version: {deepspeed.__version__}), acceleration will be enabled")
-        return True
-    except ImportError:
-        logger.warning("DeepSpeed is not installed, falling back to normal inference. Install with: pip install deepspeed")
-        return False
-    except Exception as e:
-        logger.warning(f"DeepSpeed is not available due to: {e}. Falling back to normal inference.")
-        return False
-
-
-USE_DEEPSPEED = check_deepspeed_availability()
-
-# 全局变量存储模型
+# 全局变量存储模型（在子进程中初始化）
 tts_model = None
+USE_DEEPSPEED = None  # 将在子进程中检测
 
 
 class Emotion(str, Enum):
@@ -54,10 +33,36 @@ class Emotion(str, Enum):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """管理应用生命周期"""
-    global tts_model
+    """管理应用生命周期 - 在子进程中初始化所有 torch 和模型相关的内容"""
+    global tts_model, USE_DEEPSPEED
+    
+    # 在子进程中导入 torch 和模型
+    import torch
+    from indextts.infer_v2 import IndexTTS2
+    
+    # 在子进程中检测 DeepSpeed 和 CUDA 是否可用
+    def check_deepspeed_availability():
+        """检测 DeepSpeed 是否安装并且 CUDA 是否可用"""
+        if not torch.cuda.is_available():
+            logger.info("CUDA is not available, DeepSpeed will be disabled")
+            return False
+
+        try:
+            import deepspeed
+            logger.success(f"DeepSpeed is available (version: {deepspeed.__version__}), acceleration will be enabled")
+            return True
+        except ImportError:
+            logger.warning("DeepSpeed is not installed, falling back to normal inference. Install with: pip install deepspeed")
+            return False
+        except Exception as e:
+            logger.warning(f"DeepSpeed is not available due to: {e}. Falling back to normal inference.")
+            return False
+    
     # Startup
     try:
+        logger.info("Worker process started, initializing torch and models...")
+        USE_DEEPSPEED = check_deepspeed_availability()
+        
         logger.info("Loading IndexTTS2 model...")
         logger.info(f"DeepSpeed acceleration: {'enabled' if USE_DEEPSPEED else 'disabled'}")
         tts_model = IndexTTS2(
@@ -67,7 +72,7 @@ async def lifespan(app: FastAPI):
             use_cuda_kernel=False,
             use_deepspeed=USE_DEEPSPEED
         )
-        logger.success("Model loaded successfully!")
+        logger.success("Model loaded successfully in worker process!")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
         raise e
@@ -75,7 +80,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    logger.info("Shutting down...")
+    logger.info("Worker process shutting down...")
 
 
 app = FastAPI(title="IndexTTS API Server - Stateless", lifespan=lifespan)
@@ -104,7 +109,7 @@ def is_url(s: str) -> bool:
     return s.startswith(('http://', 'https://', 'ftp://'))
 
 
-async def download_audio_from_url(url: str, timeout: float = 30.0) -> bytes:
+def download_audio_from_url(url: str, timeout: float = 30.0) -> bytes:
     """
     从URL下载音频文件并返回二进制数据
 
@@ -120,23 +125,22 @@ async def download_audio_from_url(url: str, timeout: float = 30.0) -> bytes:
     """
     try:
         logger.info(f"Downloading audio from URL: {url}")
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url)
-            response.raise_for_status()
+        response = requests.get(url, timeout=timeout)
+        response.raise_for_status()
 
-            # 检查Content-Type（可选）
-            content_type = response.headers.get('content-type', '')
-            if content_type and not any(t in content_type.lower() for t in ['audio', 'octet-stream', 'wav', 'mp3', 'mpeg']):
-                logger.warning(f"URL返回的Content-Type可能不是音频: {content_type}")
+        # 检查Content-Type（可选）
+        content_type = response.headers.get('content-type', '')
+        if content_type and not any(t in content_type.lower() for t in ['audio', 'octet-stream', 'wav', 'mp3', 'mpeg']):
+            logger.warning(f"URL返回的Content-Type可能不是音频: {content_type}")
 
-            audio_data = response.content
-            logger.success(f"Downloaded audio from URL: {url}, size={len(audio_data)} bytes")
-            return audio_data
+        audio_data = response.content
+        logger.success(f"Downloaded audio from URL: {url}, size={len(audio_data)} bytes")
+        return audio_data
 
-    except httpx.TimeoutException:
+    except requests.Timeout:
         logger.error(f"Download timeout: {url}")
         raise HTTPException(status_code=408, detail=f"Download timeout: {url}")
-    except httpx.HTTPStatusError as e:
+    except requests.HTTPError as e:
         logger.error(f"Failed to download audio: HTTP {e.response.status_code}")
         raise HTTPException(
             status_code=e.response.status_code,
@@ -150,7 +154,7 @@ async def download_audio_from_url(url: str, timeout: float = 30.0) -> bytes:
         )
 
 
-async def get_audio_data(audio_input: str) -> bytes:
+def get_audio_data(audio_input: str) -> bytes:
     """
     从不同类型的输入获取音频数据
 
@@ -165,7 +169,7 @@ async def get_audio_data(audio_input: str) -> bytes:
     """
     if is_url(audio_input):
         # 如果是URL，下载音频
-        return await download_audio_from_url(audio_input)
+        return download_audio_from_url(audio_input)
     elif is_hex_string(audio_input):
         # 如果是hex编码，直接解码
         try:
@@ -206,7 +210,7 @@ class TTSResponse(BaseModel):
 
 
 @app.get("/")
-async def root():
+def root():
     """健康检查端点"""
     return {
         "status": "running",
@@ -217,7 +221,7 @@ async def root():
 
 
 @app.get("/health")
-async def health_check():
+def health_check():
     """健康检查端点"""
     if tts_model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
@@ -230,7 +234,7 @@ async def health_check():
 
 
 @app.post("/tts", response_model=TTSResponse)
-async def text_to_speech(request: TTSRequest):
+def text_to_speech(request: TTSRequest):
     """
     TTS文本转语音接口（无状态版本）
 
@@ -254,12 +258,12 @@ async def text_to_speech(request: TTSRequest):
     try:
         # 获取说话人参考音频数据
         logger.info(f"Processing TTS request: text='{request.text[:50]}...'")
-        spk_audio_data = await get_audio_data(request.spk_audio)
+        spk_audio_data = get_audio_data(request.spk_audio)
 
         # 获取情绪参考音频数据（如果提供）
         emo_audio_data = None
         if request.emo_audio:
-            emo_audio_data = await get_audio_data(request.emo_audio)
+            emo_audio_data = get_audio_data(request.emo_audio)
 
         logger.info(
             f"Audio data ready: spk_size={len(spk_audio_data)} bytes, "

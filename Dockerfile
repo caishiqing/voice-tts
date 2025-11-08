@@ -9,7 +9,10 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple/ \
+    HF_ENDPOINT=https://hf-mirror.com \
+    HF_HUB_CACHE=/app/models/hf_cache
 
 WORKDIR /app
 
@@ -36,19 +39,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --upgrade pip setuptools wheel -i https://pypi.tuna.tsinghua.edu.cn/simple/
+RUN pip install --upgrade pip setuptools wheel
 
 # 复制项目文件
 COPY . .
 
 # 安装 Python 依赖
-RUN pip install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple/
+RUN pip install -e .
 
-# 下载模型
+# 下载所有模型
 RUN mkdir -p models/
-ENV HF_ENDPOINT="https://hf-mirror.com"
 RUN hf download IndexTeam/IndexTTS-2 --local-dir=models/IndexTTS
-
+RUN hf download facebook/w2v-bert-2.0
+RUN hf download amphion/MaskGCT
+RUN hf download funasr/campplus
+RUN hf download nvidia/bigvgan_v2_24khz_100band_256x
 # 暴露端口
 EXPOSE 8020
 
