@@ -2,6 +2,7 @@
 /checkpoints/
 /data/
 /models/
+build/
 
 # Git 相关
 .git

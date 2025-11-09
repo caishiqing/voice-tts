@@ -10,6 +10,7 @@ import tempfile
 import requests
 import wave
 import re
+import threading
 from enum import Enum
 
 # 延迟导入 torch 和模型相关的模块，避免在主进程中初始化 CUDA 上下文
@@ -18,6 +19,9 @@ from enum import Enum
 # 全局变量存储模型（在子进程中初始化）
 tts_model = None
 USE_DEEPSPEED = None  # 将在子进程中检测
+
+# 推理锁：确保线程安全，同一时间只有一个线程在执行推理
+inference_lock = threading.Lock()
 
 
 class Emotion(str, Enum):
@@ -40,42 +44,42 @@ async def lifespan(app: FastAPI):
     import torch
     from indextts.infer_v2 import IndexTTS2
     
-    # 在子进程中检测 DeepSpeed 和 CUDA 是否可用
+    # 检测 DeepSpeed 和 CUDA 是否可用
     def check_deepspeed_availability():
-        """检测 DeepSpeed 是否安装并且 CUDA 是否可用"""
         if not torch.cuda.is_available():
             logger.info("CUDA is not available, DeepSpeed will be disabled")
             return False
-
         try:
             import deepspeed
-            logger.success(f"DeepSpeed is available (version: {deepspeed.__version__}), acceleration will be enabled")
+            logger.success(f"DeepSpeed is available (version: {deepspeed.__version__})")
             return True
         except ImportError:
-            logger.warning("DeepSpeed is not installed, falling back to normal inference. Install with: pip install deepspeed")
+            logger.warning("DeepSpeed is not installed, falling back to normal inference")
             return False
         except Exception as e:
-            logger.warning(f"DeepSpeed is not available due to: {e}. Falling back to normal inference.")
+            logger.warning(f"DeepSpeed is not available: {e}")
             return False
     
     # Startup
     try:
-        logger.info("Worker process started, initializing torch and models...")
+        worker_id = os.environ.get('WORKER_ID', 'unknown')
+        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', 'default')
+        logger.info(f"Worker {worker_id} (PID: {os.getpid()}) starting, GPU: {cuda_visible}")
+        
         USE_DEEPSPEED = check_deepspeed_availability()
         
-        logger.info("Loading IndexTTS2 model...")
-        logger.info(f"DeepSpeed acceleration: {'enabled' if USE_DEEPSPEED else 'disabled'}")
+        logger.info(f"Loading IndexTTS2 model (DeepSpeed: {'enabled' if USE_DEEPSPEED else 'disabled'})...")
         tts_model = IndexTTS2(
             cfg_path="models/IndexTTS/config.yaml",
             model_dir="models/IndexTTS",
             use_fp16=True,
-            use_cuda_kernel=False,
+            use_cuda_kernel=True,
             use_deepspeed=USE_DEEPSPEED
         )
-        logger.success("Model loaded successfully in worker process!")
+        logger.success(f"Model loaded successfully on GPU: {cuda_visible}")
     except Exception as e:
         logger.error(f"Failed to load model: {e}")
-        raise e
+        raise
 
     yield
 
@@ -233,6 +237,64 @@ def health_check():
     }
 
 
+@app.get("/debug/worker-info")
+def worker_info():
+    """
+    调试端点：返回当前 worker 的信息
+    
+    用于验证 GPU 分配是否正确
+    多次请求该端点会看到不同的 worker 响应
+    
+    使用方法：
+        for i in {1..10}; do curl http://localhost:8020/debug/worker-info; echo ""; done
+    """
+    import torch
+    
+    worker_id = os.environ.get('WORKER_ID', 'unknown')
+    cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')
+    pid = os.getpid()
+    
+    gpu_info = {
+        'cuda_available': torch.cuda.is_available(),
+        'device_count': 0,
+        'current_device': None,
+        'device_name': None,
+        'device_properties': None,
+    }
+    
+    if torch.cuda.is_available():
+        gpu_info['device_count'] = torch.cuda.device_count()
+        try:
+            gpu_info['current_device'] = torch.cuda.current_device()
+            gpu_info['device_name'] = torch.cuda.get_device_name(0)
+            
+            # 获取设备属性
+            props = torch.cuda.get_device_properties(0)
+            gpu_info['device_properties'] = {
+                'name': props.name,
+                'total_memory': f"{props.total_memory / 1024**3:.2f} GB",
+                'major': props.major,
+                'minor': props.minor,
+            }
+        except Exception as e:
+            gpu_info['error'] = str(e)
+    
+    model_info = {
+        'loaded': tts_model is not None,
+        'device': str(tts_model.device) if tts_model else 'not loaded',
+        'use_fp16': tts_model.use_fp16 if tts_model else None,
+        'use_deepspeed': USE_DEEPSPEED,
+    }
+    
+    return {
+        'worker_id': worker_id,
+        'pid': pid,
+        'cuda_visible_devices': cuda_visible,
+        'gpu_info': gpu_info,
+        'model_info': model_info,
+    }
+
+
 @app.post("/tts", response_model=TTSResponse)
 def text_to_speech(request: TTSRequest):
     """
@@ -279,15 +341,18 @@ def text_to_speech(request: TTSRequest):
         import time
         start_time = time.time()
 
-        # 执行推理 - 直接传入 bytes 数据
-        result_path = tts_model.infer(
-            spk_audio_prompt=spk_audio_data,
-            text=request.text,
-            output_path=output_path,
-            emo_audio_prompt=emo_audio_data if emo_audio_data else None,
-            emo_alpha=request.emo_alpha,
-            verbose=False
-        )
+        # 执行推理 - 使用锁保证线程安全，同一时间只有一个线程在执行推理
+        with inference_lock:
+            logger.debug("Acquired inference lock, starting model inference...")
+            result_path = tts_model.infer(
+                spk_audio_prompt=spk_audio_data,
+                text=request.text,
+                output_path=output_path,
+                emo_audio_prompt=emo_audio_data if emo_audio_data else None,
+                emo_alpha=request.emo_alpha,
+                verbose=False
+            )
+            logger.debug("Model inference completed, releasing lock...")
 
         inference_time = time.time() - start_time
 
@@ -376,18 +441,85 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # 如果指定了多个 worker，使用 uvicorn 的多进程模式
+    # 如果指定了多个 worker，使用 Gunicorn + UvicornWorker
     if args.workers > 1:
-        logger.info(f"Starting server with {args.workers} workers")
-        uvicorn.run(
-            "server:app",
-            host=args.host,
-            port=args.port,
-            workers=args.workers,
-            log_level=args.log_level
-        )
+        cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', '')
+        gpus = [g.strip() for g in cuda_visible.split(',') if g.strip()] if cuda_visible else []
+        
+        logger.info(f"Starting Gunicorn server: {args.workers} workers, {args.host}:{args.port}")
+        if gpus:
+            logger.info(f"GPU assignment: {len(gpus)} GPU(s) [{cuda_visible}], round-robin distribution")
+        else:
+            logger.warning("CUDA_VISIBLE_DEVICES not set, all workers will use default device")
+        
+        try:
+            from gunicorn.app.base import BaseApplication
+            
+            class StandaloneApplication(BaseApplication):
+                """自定义 Gunicorn Application"""
+                
+                def __init__(self, app, options=None):
+                    self.options = options or {}
+                    self.application = app
+                    super().__init__()
+
+                def load_config(self):
+                    config_file = "gunicorn_config.py"
+                    if os.path.exists(config_file):
+                        # 动态导入配置文件以正确注册钩子函数
+                        import importlib.util
+                        spec = importlib.util.spec_from_file_location("gunicorn_config", config_file)
+                        config_module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(config_module)
+                        
+                        hook_names = ['post_fork', 'pre_fork', 'post_worker_init', 
+                                     'worker_int', 'worker_abort', 'pre_exec',
+                                     'when_ready', 'pre_request', 'post_request',
+                                     'child_exit', 'worker_exit', 'nworkers_changed', 'on_exit']
+                        
+                        for key in dir(config_module):
+                            if key.startswith('_'):
+                                continue
+                            value = getattr(config_module, key)
+                            if key in self.cfg.settings:
+                                self.cfg.set(key.lower(), value)
+                            elif callable(value) and key in hook_names:
+                                self.cfg.set(key, value)
+                    
+                    # 命令行参数覆盖配置文件
+                    for key, value in self.options.items():
+                        if key in self.cfg.settings and value is not None:
+                            self.cfg.set(key.lower(), value)
+
+                def load(self):
+                    return self.application
+
+            # Gunicorn 配置选项
+            options = {
+                'bind': f'{args.host}:{args.port}',
+                'workers': args.workers,
+                'worker_class': 'uvicorn.workers.UvicornWorker',
+                'worker_connections': 1,  # 单连接
+                'threads': 1,  # 单线程
+                'timeout': 300,
+                'keepalive': 5,
+                'loglevel': args.log_level,
+                'accesslog': '-',
+                'errorlog': '-',
+            }
+
+            StandaloneApplication(app, options).run()
+            
+        except ImportError:
+            logger.error("Gunicorn is not installed. Please install it with: pip install gunicorn")
+            logger.error("Or use single worker mode: python server.py --workers 1")
+            raise
+            
     else:
         # 单进程模式，支持 reload
+        logger.info("Starting server in single-process mode with Uvicorn")
+        if args.reload:
+            logger.warning("Auto-reload is enabled (development mode)")
         uvicorn.run(
             app,
             host=args.host,

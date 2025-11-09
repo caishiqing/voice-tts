@@ -6,6 +6,7 @@ __pycache__/
 /models/
 /data/
 /checkpoints/
+build/
 
 # C extensions
 *.so
