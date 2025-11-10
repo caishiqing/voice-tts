@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
-from typing import Optional
+from typing import Optional, Union, Dict
 from contextlib import asynccontextmanager
 from loguru import logger
 import uvicorn
@@ -12,6 +12,7 @@ import wave
 import re
 import threading
 from enum import Enum
+import json
 
 # 延迟导入 torch 和模型相关的模块，避免在主进程中初始化 CUDA 上下文
 # torch 和 IndexTTS2 将在子进程的 lifespan 中导入
@@ -22,17 +23,6 @@ USE_DEEPSPEED = None  # 将在子进程中检测
 
 # 推理锁：确保线程安全，同一时间只有一个线程在执行推理
 inference_lock = threading.Lock()
-
-
-class Emotion(str, Enum):
-    """情绪枚举"""
-    NORMAL = "normal"
-    HAPPY = "happy"
-    ANGRY = "angry"
-    SAD = "sad"
-    FEARFUL = "fearful"
-    DISGUSTED = "disgusted"
-    SURPRISED = "surprised"
 
 
 @asynccontextmanager
@@ -195,13 +185,45 @@ class TTSRequest(BaseModel):
     text: str = Field(..., description="要合成的文本")
     spk_audio: str = Field(..., description="说话人参考音频（支持URL或hex编码）")
     emo_audio: Optional[str] = Field(None, description="情绪参考音频（支持URL或hex编码，可选）")
-    emo_alpha: float = Field(default=1.0, description="情绪强度（0.0-1.0），默认1.0")
+    emotion: Optional[Union[str, Dict[str, float]]] = Field(
+        None, 
+        description="情绪控制（可选），支持两种格式：\n"
+                   "1. 字符串：单个情绪标签，支持中英文同义词（如 'happy', '高兴', 'joyful'）\n"
+                   "2. 字典：多个情绪组合，如 {'happy': 0.7, '生气': 0.3}\n"
+                   "标准维度：happy/高兴, angry/愤怒, sad/悲伤, afraid/恐惧, "
+                   "disgusted/反感, melancholic/低落, surprised/惊讶, calm/平静。\n"
+                   "优先级：emo_audio > emotion"
+    )
+    emo_alpha: float = Field(
+        default=1.0, 
+        description="情绪强度（0.0-1.0），默认1.0。\n"
+                   "当emotion为字符串时：作为该情绪维度的值\n"
+                   "当emotion为字典时：此参数被忽略，使用字典中的值"
+    )
 
     @validator('emo_alpha')
     def validate_emo_alpha(cls, v):
         if not 0.0 <= v <= 1.0:
             raise ValueError('emo_alpha must be between 0.0 and 1.0')
         return v
+    
+    @validator('emotion')
+    def validate_emotion(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, str):
+            return v
+        if isinstance(v, dict):
+            # 验证字典中的值都是数字
+            for key, value in v.items():
+                if not isinstance(key, str):
+                    raise ValueError(f"Emotion dict keys must be strings, got {type(key)}")
+                if not isinstance(value, (int, float)):
+                    raise ValueError(f"Emotion dict values must be numbers, got {type(value)}")
+                if not 0.0 <= value <= 1.0:
+                    raise ValueError(f"Emotion values must be between 0.0 and 1.0, got {value}")
+            return v
+        raise ValueError("emotion must be a string or dict")
 
 
 class TTSResponse(BaseModel):
@@ -302,7 +324,8 @@ def text_to_speech(request: TTSRequest):
 
     通过URL或hex编码传入参考音频进行语音合成
     - spk_audio: 说话人参考音频（URL或hex编码，必需）
-    - emo_audio: 情绪参考音频（URL或hex编码，可选）
+    - emo_audio: 情绪参考音频（URL或hex编码，可选，优先级高）
+    - emotion: 情绪标签（可选，当未提供emo_audio时使用）
     - emo_alpha: 情绪强度（0.0-1.0）
 
     Args:
@@ -324,14 +347,30 @@ def text_to_speech(request: TTSRequest):
 
         # 获取情绪参考音频数据（如果提供）
         emo_audio_data = None
+        emo_vector = None
+        
         if request.emo_audio:
+            # 优先使用 emo_audio
             emo_audio_data = get_audio_data(request.emo_audio)
+            logger.info(f"Using emo_audio: size={len(emo_audio_data)} bytes, alpha={request.emo_alpha}")
+        elif request.emotion:
+            # 如果没有 emo_audio，但提供了 emotion 标签或字典
+            from emotion import create_emotion_vector
+            
+            if isinstance(request.emotion, str):
+                # 模式1：单个情绪标签字符串
+                logger.info(f"Using emotion label: '{request.emotion}', alpha={request.emo_alpha}")
+                emo_vector = create_emotion_vector(request.emotion, request.emo_alpha)
+                
+            elif isinstance(request.emotion, dict):
+                # 模式2：情绪字典（支持多个情绪组合）
+                logger.info(f"Using emotion dict: {request.emotion}")
+                emo_vector = create_emotion_vector(request.emotion)
+            
+            logger.info(f"Generated emotion vector: {emo_vector}")
 
-        logger.info(
-            f"Audio data ready: spk_size={len(spk_audio_data)} bytes, "
-            f"emo_size={len(emo_audio_data) if emo_audio_data else 0} bytes, "
-            f"emo_alpha={request.emo_alpha}"
-        )
+        if not request.emo_audio and not request.emotion:
+            logger.info(f"No emotion control specified, using default (emo_alpha={request.emo_alpha})")
 
         # 创建临时输出文件
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
@@ -349,7 +388,8 @@ def text_to_speech(request: TTSRequest):
                 text=request.text,
                 output_path=output_path,
                 emo_audio_prompt=emo_audio_data if emo_audio_data else None,
-                emo_alpha=request.emo_alpha,
+                emo_alpha=request.emo_alpha if emo_audio_data else 1.0,  # emotion模式下alpha已体现在vector中
+                emo_vector=emo_vector,  # 传入情绪向量（如果有）
                 verbose=False
             )
             logger.debug("Model inference completed, releasing lock...")
