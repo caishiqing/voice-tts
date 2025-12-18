@@ -65,6 +65,9 @@ dependencies = [
   "deepspeed==0.18.1",
   "httpx==0.28.1",
   "gunicorn==23.0.0",
+  "requests==2.32.3",
+  "audioread==3.0.1",
+  "pydub==0.25.1",
 
   # Use "wetext" on Windows/Mac, otherwise "WeTextProcessing" on Linux.
   "wetext>=0.0.9; sys_platform != 'linux'",
