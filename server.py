@@ -14,12 +14,14 @@ import threading
 from enum import Enum
 import json
 
+# 缓存模块
+from cache import get_audio_cache
+
 # 延迟导入 torch 和模型相关的模块，避免在主进程中初始化 CUDA 上下文
 # torch 和 IndexTTS2 将在子进程的 lifespan 中导入
 
 # 全局变量存储模型（在子进程中初始化）
 tts_model = None
-USE_DEEPSPEED = None  # 将在子进程中检测
 
 # 推理锁：确保线程安全，同一时间只有一个线程在执行推理
 inference_lock = threading.Lock()
@@ -28,27 +30,10 @@ inference_lock = threading.Lock()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """管理应用生命周期 - 在子进程中初始化所有 torch 和模型相关的内容"""
-    global tts_model, USE_DEEPSPEED
+    global tts_model
     
     # 在子进程中导入 torch 和模型
-    import torch
     from indextts.infer_v2 import IndexTTS2
-    
-    # 检测 DeepSpeed 和 CUDA 是否可用
-    def check_deepspeed_availability():
-        if not torch.cuda.is_available():
-            logger.info("CUDA is not available, DeepSpeed will be disabled")
-            return False
-        try:
-            import deepspeed
-            logger.success(f"DeepSpeed is available (version: {deepspeed.__version__})")
-            return True
-        except ImportError:
-            logger.warning("DeepSpeed is not installed, falling back to normal inference")
-            return False
-        except Exception as e:
-            logger.warning(f"DeepSpeed is not available: {e}")
-            return False
     
     # Startup
     try:
@@ -56,15 +41,12 @@ async def lifespan(app: FastAPI):
         cuda_visible = os.environ.get('CUDA_VISIBLE_DEVICES', 'default')
         logger.info(f"Worker {worker_id} (PID: {os.getpid()}) starting, GPU: {cuda_visible}")
         
-        USE_DEEPSPEED = check_deepspeed_availability()
-        
-        logger.info(f"Loading IndexTTS2 model (DeepSpeed: {'enabled' if USE_DEEPSPEED else 'disabled'})...")
+        logger.info("Loading IndexTTS2 model...")
         tts_model = IndexTTS2(
             cfg_path="models/IndexTTS/config.yaml",
             model_dir="models/IndexTTS",
             use_fp16=True,
-            use_cuda_kernel=True,
-            use_deepspeed=USE_DEEPSPEED
+            use_cuda_kernel=False
         )
         logger.success(f"Model loaded successfully on GPU: {cuda_visible}")
     except Exception as e:
@@ -162,8 +144,12 @@ def get_audio_data(audio_input: str) -> bytes:
         HTTPException: 处理失败时抛出
     """
     if is_url(audio_input):
-        # 如果是URL，下载音频
-        return download_audio_from_url(audio_input)
+        # 如果是URL，优先从缓存获取，未命中则下载并缓存
+        cache = get_audio_cache()
+        return cache.get_audio_from_url(
+            url=audio_input,
+            download_func=download_audio_from_url
+        )
     elif is_hex_string(audio_input):
         # 如果是hex编码，直接解码
         try:
@@ -252,11 +238,24 @@ def health_check():
     if tts_model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
+    cache = get_audio_cache()
     return {
         "status": "healthy",
         "model_loaded": True,
-        "deepspeed_enabled": USE_DEEPSPEED
+        "cache_enabled": cache.enabled
     }
+
+
+@app.get("/debug/cache-stats")
+def cache_stats():
+    """
+    缓存状态端点：返回 Redis 缓存的统计信息
+    
+    使用方法：
+        curl http://localhost:8020/debug/cache-stats
+    """
+    cache = get_audio_cache()
+    return cache.get_stats()
 
 
 @app.get("/debug/worker-info")
@@ -305,7 +304,6 @@ def worker_info():
         'loaded': tts_model is not None,
         'device': str(tts_model.device) if tts_model else 'not loaded',
         'use_fp16': tts_model.use_fp16 if tts_model else None,
-        'use_deepspeed': USE_DEEPSPEED,
     }
     
     return {

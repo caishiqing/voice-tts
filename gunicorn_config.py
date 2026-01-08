@@ -10,6 +10,7 @@ import os
 bind = "0.0.0.0:8020"
 workers = 4
 worker_class = "uvicorn.workers.UvicornWorker"
+reuse_port = True
 
 # 单线程模式（避免线程安全问题）
 # worker_connections = 1
