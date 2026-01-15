@@ -38,7 +38,6 @@ fi
 docker run -itd --gpus all --name $CONTAINER_NAME \
 -p $PORT:$PORT \
 -w /app \
--v $PWD:/app \
 -e HF_ENDPOINT="https://hf-mirror.com" \
 -e HF_HUB_CACHE=/app/models/hf_cache \
 -e CUDA_VISIBLE_DEVICES=$GPU_IDS \

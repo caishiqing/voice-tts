@@ -2,7 +2,8 @@
 # IndexTTS2 API Server - NVIDIA CUDA Image
 # ============================================
 
-FROM docker.m.daocloud.io/nvidia/cuda:12.4.0-devel-ubuntu22.04
+ARG BASE_IMAGE=docker.m.daocloud.io/nvidia/cuda:12.4.0-devel-ubuntu22.04
+FROM ${BASE_IMAGE}
 
 # 设置环境变量
 ENV PYTHONUNBUFFERED=1 \
